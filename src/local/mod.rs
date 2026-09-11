@@ -30,6 +30,7 @@ pub mod model;
 pub mod native_store;
 pub mod omniroute;
 pub mod opencode;
+pub mod test_detector;
 pub mod openresearch;
 pub mod overleaf;
 pub mod overleaf_live;
