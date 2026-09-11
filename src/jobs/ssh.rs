@@ -1,0 +1,640 @@
+//! SSH backend — run an experiment as a detached process on your own box.
+//!
+//! No scheduler: the target is a plain server you can `ssh` into. Everything
+//! shells out to the `ssh` binary (like the k8s backend shells out to
+//! `kubectl`), so auth is your `~/.ssh/config` + agent/keys — orx never reads a
+//! key. Connections are multiplexed (ControlMaster) so the many status/log
+//! polls reuse one TCP session instead of a handshake apiece.
+//!
+//! The handle is a remote run directory `~/.orx/runs/<run_id>/` holding:
+//!   run.sh      the launcher (exported env + snapshot-and-run payload)
+//!   log         merged stdout/stderr
+//!   pid         the detached process-group leader
+//!   exit_code   written when the payload finishes
+//! A restarted `orx supervise` reattaches purely from that directory.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::process::Command;
+
+use crate::error::{anyhow, Result};
+
+/// Keep sockets out of config paths, which can exceed macOS's 104-byte limit.
+#[cfg(unix)]
+fn control_dir() -> PathBuf {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let uid = unsafe { libc::geteuid() };
+    let mut namespace = std::collections::hash_map::DefaultHasher::new();
+    crate::config::config_dir().hash(&mut namespace);
+    PathBuf::from("/tmp").join(format!("orx-ssh-{uid}-{:08x}", namespace.finish() as u32))
+}
+
+#[cfg(not(unix))]
+fn control_dir() -> PathBuf {
+    crate::config::config_dir().join("ssh-cm")
+}
+
+fn prepare_control_dir() -> Result<()> {
+    let dir = control_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        anyhow!(
+            "Could not create SSH control directory {}: {e}",
+            dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = std::fs::symlink_metadata(&dir)?;
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.file_type().is_dir() || metadata.uid() != uid {
+            return Err(anyhow!(
+                "SSH control path {} is not an owner-controlled directory.",
+                dir.display()
+            ));
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&dir, permissions)?;
+    }
+    Ok(())
+}
+
+/// An ssh endpoint. The classic ssh backend connects by `~/.ssh/config` alias
+/// (`SshTarget::alias`); backends that learn an endpoint at runtime (an
+/// OpenResearch box on a provider-assigned host:port) pass an explicit
+/// `user@host` plus the options no config file knows about.
+#[derive(Debug, Clone)]
+pub struct SshTarget {
+    /// What goes after `--`: an alias, or `user@host`.
+    pub dest: String,
+    /// Extra ssh args before `--` (e.g. `["-p", "2222", "-o", …]`).
+    pub extra_opts: Vec<String>,
+}
+
+/// How to treat the remote's SSH host key for a `host_port` target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKeyPolicy {
+    /// `~/.ssh/config` + the user's own `known_hosts` decide everything — impose
+    /// nothing. For a user-typed hostname they may already have pinned.
+    UserConfig,
+    /// `StrictHostKeyChecking=accept-new` against the user's real `known_hosts`:
+    /// genuine trust-on-first-use — the first connection is accepted and
+    /// recorded, and a later key change is caught. For a freshly-seen box
+    /// identified by a raw IP (nothing to have pinned yet).
+    AcceptNew,
+    /// `StrictHostKeyChecking=no` + `UserKnownHostsFile=/dev/null`: accept any
+    /// key every time, persist nothing. ONLY for machine-provisioned boxes whose
+    /// proxy `host:port` pairs are recycled by the provider, where a real pin
+    /// would just produce spurious mismatches (see `openresearch_ssh_target`).
+    Ephemeral,
+}
+
+impl SshTarget {
+    /// A bare alias — `~/.ssh/config` alone decides the endpoint.
+    pub fn alias(host: &str) -> Self {
+        Self {
+            dest: host.to_string(),
+            extra_opts: Vec::new(),
+        }
+    }
+
+    /// `dest` (an alias or `user@host`) on an explicit `port`, with an explicit
+    /// host-key `policy`. Centralizes the `-p`/`-o` opt vector that both the
+    /// `--remote` CLI and the openresearch backend need, so the host-key
+    /// rationale lives in one place ([`HostKeyPolicy`]) instead of drifting
+    /// across call sites.
+    pub fn host_port(dest: String, port: u16, policy: HostKeyPolicy) -> Self {
+        let mut extra_opts = vec!["-p".into(), port.to_string()];
+        match policy {
+            HostKeyPolicy::UserConfig => {}
+            HostKeyPolicy::AcceptNew => {
+                extra_opts.extend(["-o".into(), "StrictHostKeyChecking=accept-new".into()]);
+            }
+            HostKeyPolicy::Ephemeral => {
+                extra_opts.extend([
+                    "-o".into(),
+                    "StrictHostKeyChecking=no".into(),
+                    "-o".into(),
+                    "UserKnownHostsFile=/dev/null".into(),
+                    "-o".into(),
+                    "LogLevel=ERROR".into(),
+                ]);
+            }
+        }
+        Self { dest, extra_opts }
+    }
+}
+
+fn control_path(target: &SshTarget) -> PathBuf {
+    // A 16-hex hash leaves room for ssh's temporary bind suffix. It folds in
+    // the extra opts so different ports never share a control socket.
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    target.dest.hash(&mut h);
+    target.extra_opts.hash(&mut h);
+    control_dir().join(format!("{:016x}", h.finish()))
+}
+
+/// Shared ssh options: connection setup permits prompts; background work never
+/// does. Both modes use the same control socket, kept for ten idle minutes, so
+/// one interactive login covers later status, log, and job commands.
+fn ssh_opts(target: &SshTarget, batch: bool) -> Vec<String> {
+    let mut opts = vec![
+        "-o".into(),
+        format!("BatchMode={}", if batch { "yes" } else { "no" }),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        "-o".into(),
+        "ControlMaster=auto".into(),
+        "-o".into(),
+        format!("ControlPath={}", control_path(target).display()),
+        "-o".into(),
+        "ControlPersist=600".into(),
+    ];
+    opts.extend(target.extra_opts.iter().cloned());
+    opts
+}
+
+/// Arguments for a long-lived local forward over the same authenticated
+/// ControlMaster used by settings and background jobs.
+pub(crate) fn forward_args(
+    target: &SshTarget,
+    forward: &str,
+    remote_cmd: &str,
+) -> Result<Vec<String>> {
+    prepare_control_dir()?;
+    let mut args = ssh_opts(target, true);
+    for option in [
+        "ExitOnForwardFailure=yes",
+        "ServerAliveInterval=30",
+        "ServerAliveCountMax=3",
+    ] {
+        args.extend(["-o".into(), option.into()]);
+    }
+    args.extend([
+        // No PTY: the remote session bearer is delivered over stdin and must
+        // never be echoed by terminal line discipline.
+        "-T".into(),
+        "-L".into(),
+        forward.into(),
+        "--".into(),
+        target.dest.clone(),
+        remote_cmd.into(),
+    ]);
+    Ok(args)
+}
+
+/// Arguments for the short interactive login opened by Settings. `true` ends
+/// the visible session after authentication while ControlPersist keeps its
+/// master connection available to the ordinary batch-mode calls below.
+pub(crate) fn interactive_args(target: &SshTarget) -> Result<Vec<String>> {
+    prepare_control_dir()?;
+    let mut args = ssh_opts(target, false);
+    args.extend(["--".into(), target.dest.clone(), "true".into()]);
+    Ok(args)
+}
+
+pub(crate) async fn master_is_running(target: &SshTarget) -> Result<bool> {
+    prepare_control_dir()?;
+    let path = control_path(target);
+    if !path.try_exists()? {
+        return Ok(false);
+    }
+    let status = Command::new("ssh")
+        .args(["-O", "check", "-S"])
+        .arg(path)
+        .arg("--")
+        .arg(&target.dest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .status()
+        .await
+        .map_err(|e| anyhow!("Could not check the SSH master: {e}"))?;
+    Ok(status.success())
+}
+
+/// Run a command on `target` over ssh, feeding `stdin` if given, returning stdout.
+/// A non-zero exit is an error carrying stderr (the ssh/remote failure reason).
+/// Shared with the slurm backend, which drives a cluster's login node the same
+/// way, and the openresearch backend, which drives a provisioned box.
+pub(crate) async fn ssh_run(
+    target: &SshTarget,
+    remote_cmd: &str,
+    stdin: Option<&str>,
+) -> Result<String> {
+    ssh_run_bytes(target, remote_cmd, stdin.map(str::as_bytes)).await
+}
+
+async fn ssh_run_bytes(
+    target: &SshTarget,
+    remote_cmd: &str,
+    stdin: Option<&[u8]>,
+) -> Result<String> {
+    prepare_control_dir()?;
+    let mut cmd = Command::new("ssh");
+    cmd.args(ssh_opts(target, true))
+        .arg("--")
+        .arg(&target.dest)
+        .arg(remote_cmd)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow!("`ssh` not found on PATH — the SSH backend needs the OpenSSH client.")
+        } else {
+            anyhow!("Could not run ssh: {e}")
+        }
+    })?;
+    if let Some(input) = stdin {
+        use tokio::io::AsyncWriteExt as _;
+        if let Some(mut pipe) = child.stdin.take() {
+            let _ = pipe.write_all(input).await;
+            drop(pipe); // EOF
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| anyhow!("ssh wait failed: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err.trim();
+        return Err(anyhow!(
+            "ssh {} failed{}: {}",
+            target.dest,
+            out.status
+                .code()
+                .map(|c| format!(" (exit {c})"))
+                .unwrap_or_default(),
+            if err.is_empty() { "no stderr" } else { err }
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+async fn ssh_run_file(
+    target: &SshTarget,
+    remote_cmd: &str,
+    source: &std::path::Path,
+) -> Result<String> {
+    prepare_control_dir()?;
+    let mut child = Command::new("ssh")
+        .args(ssh_opts(target, true))
+        .arg("--")
+        .arg(&target.dest)
+        .arg(remote_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("Could not run ssh: {e}"))?;
+    let mut file = tokio::fs::File::open(source).await?;
+    if let Some(mut pipe) = child.stdin.take() {
+        tokio::io::copy(&mut file, &mut pipe).await?;
+        drop(pipe);
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| anyhow!("ssh wait failed: {e}"))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "ssh {} failed: {}",
+            target.dest,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Upload a content-addressed tar once, then materialize it into this run's
+/// private `repo/` directory. Both the cache write and extraction are safe to
+/// repeat after a client or supervisor restart.
+pub async fn stage_source(
+    target: &SshTarget,
+    run_id: &str,
+    archive: &std::path::Path,
+    digest: &str,
+) -> Result<String> {
+    let dir = format!(".orx/runs/{run_id}");
+    let cache = format!(".orx/source/{digest}.tar");
+    let present = ssh_run(
+        target,
+        &format!("test -f \"$HOME/{cache}\" && echo present || true"),
+        None,
+    )
+    .await?;
+    if present.trim() != "present" {
+        let upload = format!(
+            "umask 077; mkdir -p \"$HOME/.orx/source\"; \
+             tmp=\"$HOME/{cache}.tmp.$$\"; cat > \"$tmp\" && mv \"$tmp\" \"$HOME/{cache}\""
+        );
+        ssh_run_file(target, &upload, archive).await?;
+    }
+    ssh_run(
+        target,
+        &format!(
+            "umask 077; mkdir -p \"$HOME/.orx/runs\" \"$HOME/{dir}/repo\"; \
+             chmod 700 \"$HOME/.orx/runs\" \"$HOME/{dir}\" \"$HOME/{dir}/repo\"; \
+             tar -xf \"$HOME/{cache}\" -C \"$HOME/{dir}/repo\""
+        ),
+        None,
+    )
+    .await?;
+    Ok(dir)
+}
+
+/// Single-quote a value for safe embedding in the remote bash script.
+pub(crate) fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+pub struct SshJobSpec {
+    /// Where to run: a config alias (the ssh backend) or an explicit endpoint.
+    pub target: SshTarget,
+    /// Names the remote run dir `~/.orx/runs/<run_id>`.
+    pub run_id: String,
+    /// The shared snapshot-and-run payload (`bash` script body).
+    pub script: String,
+    /// Exported inside run.sh on the remote (tokens, synced env).
+    pub env: HashMap<String, String>,
+}
+
+/// Submit the job: write run.sh, launch it detached, record its pid. Returns
+/// the remote run dir (relative to `$HOME`) — the reattach handle.
+pub async fn run_job(spec: &SshJobSpec) -> Result<String> {
+    let dir = format!(".orx/runs/{}", spec.run_id);
+    // Default the remote job's Python to unbuffered so its prints land in `log`
+    // (which we tail) live instead of block-buffering behind the redirect
+    // (see jobs::default_unbuffered).
+    let env = super::default_unbuffered(&spec.env);
+    let exports: String = env
+        .iter()
+        .map(|(k, v)| format!("export {}={}", k, sh_quote(v)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // run.sh: set up env, run the payload capturing all output to `log`, then
+    // record the exit status. The payload runs in a SUBSHELL `( … )` — not a
+    // `{ … }` group — so an `exit`/`set -e` failure inside it ends the subshell,
+    // not run.sh, and we still reach `echo $? > exit_code`.
+    let run_sh = format!(
+        "#!/usr/bin/env bash\n{exports}\ncd \"$HOME/{dir}\" || exit 97\n(\n{script}\n) > log 2>&1\necho $? > exit_code\n",
+        script = spec.script,
+    );
+
+    // Create the dir (owner-only) and write run.sh from stdin.
+    let setup = format!(
+        "mkdir -p \"$HOME/{dir}\" && chmod 700 \"$HOME/{dir}\" && cat > \"$HOME/{dir}/run.sh\"",
+    );
+    ssh_run(&spec.target, &setup, Some(&run_sh)).await?;
+
+    // Launch detached so it survives the ssh channel closing. Prefer `setsid`
+    // (new session → pid == pgid, so cancel can TERM the whole group); fall back
+    // to `nohup` where setsid is absent (e.g. a macOS host). Record the pid.
+    let launch = format!(
+        "cd \"$HOME/{dir}\" && \
+         if command -v setsid >/dev/null 2>&1; then setsid bash run.sh </dev/null >/dev/null 2>&1 & \
+         else nohup bash run.sh </dev/null >/dev/null 2>&1 & fi; \
+         echo $! > pid",
+    );
+    ssh_run(&spec.target, &launch, None).await?;
+    Ok(dir)
+}
+
+/// Job state in the shared stage vocabulary (see `jobs::stage_to_run_status`).
+#[derive(Debug, Clone)]
+pub struct JobState {
+    pub stage: String,
+    pub message: Option<String>,
+}
+
+pub async fn inspect_job(target: &SshTarget, dir: &str) -> Result<JobState> {
+    // exit_code present -> finished; pid alive -> running; pid dead & no
+    // exit_code -> killed/crashed; no pid yet -> just starting.
+    let cmd = format!(
+        "d=\"$HOME/{dir}\"; \
+         if [ -f \"$d/exit_code\" ]; then echo \"EXIT $(cat \"$d/exit_code\")\"; \
+         elif [ -f \"$d/pid\" ] && kill -0 \"$(cat \"$d/pid\")\" 2>/dev/null; then echo RUNNING; \
+         elif [ -f \"$d/pid\" ]; then echo DEAD; else echo PENDING; fi",
+    );
+    let out = ssh_run(target, &cmd, None).await?;
+    let out = out.trim();
+    if let Some(code) = out.strip_prefix("EXIT ") {
+        let code: i32 = code.trim().parse().unwrap_or(-1);
+        return Ok(if code == 0 {
+            JobState {
+                stage: "COMPLETED".into(),
+                message: None,
+            }
+        } else {
+            JobState {
+                stage: "ERROR".into(),
+                message: Some(format!("exited with code {code}")),
+            }
+        });
+    }
+    Ok(match out {
+        "RUNNING" | "PENDING" => JobState {
+            stage: "RUNNING".into(),
+            message: None,
+        },
+        "DEAD" => JobState {
+            stage: "ERROR".into(),
+            message: Some("process died without an exit code (killed?)".into()),
+        },
+        other => JobState {
+            stage: "RUNNING".into(),
+            message: Some(format!("unexpected inspect output: {other}")),
+        },
+    })
+}
+
+/// One poll of the remote log past `skip` lines. Unlike the streaming backends
+/// this returns promptly (the supervisor loops every ~2s); `idle` is unused.
+pub async fn stream_logs(
+    target: &SshTarget,
+    dir: &str,
+    skip: u64,
+    _idle: Duration,
+    sink: &mut (dyn FnMut(&str) + Send),
+) -> Result<u64> {
+    let cmd = format!(
+        "tail -n +{} \"$HOME/{}/log\" 2>/dev/null || true",
+        skip + 1,
+        dir
+    );
+    let out = ssh_run(target, &cmd, None).await?;
+    let mut seen = skip;
+    // A trailing newline yields a final empty element under split('\n'); use
+    // lines() which ignores it, matching the "one line = one log line" contract.
+    for line in out.lines() {
+        seen += 1;
+        sink(line);
+    }
+    Ok(seen)
+}
+
+/// Cancel = TERM the process group if we have one (setsid case), else the pid
+/// (nohup fallback). The negative-pid form targets the whole group.
+pub async fn cancel_job(target: &SshTarget, dir: &str) -> Result<()> {
+    let cmd = format!(
+        "p=$(cat \"$HOME/{dir}/pid\" 2>/dev/null); \
+         [ -n \"$p\" ] && {{ kill -TERM -\"$p\" 2>/dev/null || kill -TERM \"$p\" 2>/dev/null; }}; true",
+    );
+    ssh_run(target, &cmd, None).await?;
+    Ok(())
+}
+
+/// Per-host readiness for the Settings UI: can we reach it and execute snapshots?
+pub struct SshPreflight {
+    pub reachable: bool,
+    pub tools_found: bool,
+    pub missing_tools: Vec<String>,
+    pub error: Option<String>,
+}
+
+pub async fn preflight(target: &SshTarget) -> SshPreflight {
+    match ssh_run(
+        target,
+        "command -v bash >/dev/null 2>&1 || echo MISSING_BASH; \
+         command -v tar >/dev/null 2>&1 || echo MISSING_TAR",
+        None,
+    )
+    .await
+    {
+        Ok(out) => {
+            let missing_tools = [("MISSING_BASH", "bash"), ("MISSING_TAR", "tar")]
+                .into_iter()
+                .filter(|(marker, _)| out.contains(marker))
+                .map(|(_, tool)| tool.to_string())
+                .collect::<Vec<_>>();
+            let error = (!missing_tools.is_empty()).then(|| {
+                format!(
+                    "This host needs {} installed before orx can copy and run experiments. Install the missing tools, then retest.",
+                    missing_tools.join(" and ")
+                )
+            });
+            SshPreflight {
+                reachable: true,
+                tools_found: missing_tools.is_empty(),
+                missing_tools,
+                error,
+            }
+        }
+        Err(e) => SshPreflight {
+            reachable: false,
+            tools_found: false,
+            missing_tools: Vec::new(),
+            error: Some(e.to_string()),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alias_target_adds_no_extra_opts() {
+        let target = SshTarget::alias("mybox");
+        assert_eq!(target.dest, "mybox");
+        assert!(target.extra_opts.is_empty());
+        // No `-p`/`-o Strict…` beyond the shared multiplexing opts.
+        assert_eq!(ssh_opts(&target, true).len(), 10);
+    }
+
+    #[test]
+    fn host_port_policy_shapes_the_opt_vector() {
+        // UserConfig: -p only, user's own config/known_hosts untouched.
+        let t = SshTarget::host_port("root@h".into(), 2222, HostKeyPolicy::UserConfig);
+        assert_eq!(t.extra_opts, vec!["-p".to_string(), "2222".to_string()]);
+
+        // AcceptNew: real TOFU — accept-new, but NOT /dev/null.
+        let t = SshTarget::host_port("root@h".into(), 2222, HostKeyPolicy::AcceptNew);
+        let joined = t.extra_opts.join(" ");
+        assert!(joined.contains("-p 2222"));
+        assert!(joined.contains("StrictHostKeyChecking=accept-new"));
+        assert!(!joined.contains("/dev/null"));
+
+        // Ephemeral: provider box — accept-anything, persist nothing. Assert the
+        // EXACT vector so the openresearch backend (which relies on this shape,
+        // incl. LogLevel=ERROR and ordering) can't silently drift.
+        let t = SshTarget::host_port("root@h".into(), 2222, HostKeyPolicy::Ephemeral);
+        assert_eq!(
+            t.extra_opts,
+            vec![
+                "-p",
+                "2222",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "LogLevel=ERROR",
+            ]
+        );
+    }
+
+    /// Explicit targets on the same host but different ports must not share a
+    /// ControlMaster socket — the opts are part of the ControlPath hash.
+    #[test]
+    fn control_path_differs_per_port() {
+        let control_path = |t: &SshTarget| {
+            ssh_opts(t, true)
+                .into_iter()
+                .find(|o| o.starts_with("ControlPath="))
+                .unwrap()
+        };
+        let mk = |port: &str| SshTarget {
+            dest: "root@h".to_string(),
+            extra_opts: vec!["-p".into(), port.into()],
+        };
+        assert_ne!(control_path(&mk("22022")), control_path(&mk("22023")));
+        assert_eq!(control_path(&mk("22022")), control_path(&mk("22022")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_path_fits_macos_unix_socket_limit() {
+        let option = ssh_opts(
+            &SshTarget::host_port("root@ssh3.vast.ai".into(), 22, HostKeyPolicy::Ephemeral),
+            true,
+        )
+        .into_iter()
+        .find(|o| o.starts_with("ControlPath="))
+        .unwrap();
+        let path = option.strip_prefix("ControlPath=").unwrap();
+
+        assert!(path.starts_with("/tmp/orx-ssh-"));
+        assert!(path.len() + 17 < 104, "{path}");
+    }
+
+    #[test]
+    fn interactive_and_batch_modes_share_the_control_path() {
+        let target = SshTarget::alias("cluster");
+        let option = |batch| {
+            ssh_opts(&target, batch)
+                .into_iter()
+                .find(|arg| arg.starts_with("ControlPath="))
+                .unwrap()
+        };
+
+        assert_eq!(option(true), option(false));
+        assert!(ssh_opts(&target, true).contains(&"BatchMode=yes".to_string()));
+        assert!(ssh_opts(&target, false).contains(&"BatchMode=no".to_string()));
+    }
+}
