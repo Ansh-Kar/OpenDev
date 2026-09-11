@@ -470,40 +470,9 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         )
         .route("/api/projects/{id}/file/raw", get(project_raw_file))
         .route("/api/projects/{id}/file/open", post(open_project_file))
-        .route("/api/projects/{id}/file/latex", post(compile_project_latex))
-        .route("/api/latex/engine", get(latex_engine))
-        .route(
-            "/api/projects/{id}/file/overleaf",
-            get(overleaf_link)
-                .post(link_overleaf)
-                .delete(unlink_overleaf),
-        )
-        .route("/api/projects/{id}/file/overleaf/sync", post(sync_overleaf))
-        .route(
-            "/api/projects/{id}/file/overleaf/status",
-            get(overleaf_status),
-        )
-        .route(
-            "/api/projects/{id}/file/overleaf/upload",
-            get(overleaf_upload),
-        )
-        .route("/api/overleaf/settings", get(overleaf_settings))
-        .route(
-            "/api/overleaf/token",
-            post(set_overleaf_token).delete(delete_overleaf_token),
-        )
-        .route(
-            "/api/overleaf/session",
-            post(set_overleaf_session).delete(delete_overleaf_session),
-        )
-        .route(
-            "/api/overleaf/session/import",
-            post(import_overleaf_session),
-        )
-        .route(
-            "/api/projects/{id}/file/overleaf/live",
-            post(start_overleaf_live).delete(stop_overleaf_live),
-        )
+        .route("/api/worktree/create", post(create_worktree_endpoint))
+        .route("/api/worktree/{sessionId}/diff", get(get_worktree_diff_endpoint))
+        .route("/api/worktree/{sessionId}/test-config", get(get_worktree_test_config_endpoint))
         .route("/api/files/abs", get(absolute_file))
         .route("/api/files/abs/raw", get(absolute_raw_file))
         .route(
@@ -3157,6 +3126,84 @@ async fn latex_engine() -> ApiResult {
 }
 
 // --- overleaf ------------------------------------------------------------------
+
+// --- worktree endpoints (OpenDev) -----------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateWorktreeReq {
+    project_id: String,
+    session_id: String,
+    branch_name: Option<String>,
+}
+
+async fn create_worktree_endpoint(Json(req): Json<CreateWorktreeReq>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&req.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        let worktree_dir = local::git::ensure_session_worktree(&project, &req.session_id)
+            .map_err(|e| bad_request(format!("Could not create worktree: {e}")))?;
+        if let Some(branch) = &req.branch_name {
+            let _ = local::git::create_experiment_branch(&project.repo_path, branch, &project.baseline_branch);
+        }
+        let branch = local::git::current_branch(&worktree_dir);
+        Ok(Json(json!({
+            "ok": true,
+            "worktreePath": worktree_dir.to_string_lossy(),
+            "branchName": branch,
+            "sessionId": req.session_id,
+        })))
+    })
+    .await
+}
+
+async fn get_worktree_diff_endpoint(Path(session_id): Path<String>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let session = store
+            .get_chat_session(&session_id)?
+            .ok_or_else(|| not_found("chat session"))?;
+        let project = store
+            .get_local_project(&session.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        let (root, root_kind) = resolve_checkout_root(&store, &project, Some(&session_id))?;
+        if root_kind != "worktree" {
+            return Ok(Json(json!({ "exists": false })));
+        }
+        let diff = local::git::working_tree_diff_against(&root, Some(&project.baseline_branch))
+            .map(|d| d.text)
+            .unwrap_or_default();
+        let files = local::git::list_worktree_files(&root).unwrap_or_default();
+        Ok(Json(json!({
+            "exists": true,
+            "diff": diff,
+            "files": files,
+        })))
+    })
+    .await
+}
+
+async fn get_worktree_test_config_endpoint(Path(session_id): Path<String>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let session = store
+            .get_chat_session(&session_id)?
+            .ok_or_else(|| not_found("chat session"))?;
+        let project = store
+            .get_local_project(&session.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        let (root, _) = resolve_checkout_root(&store, &project, Some(&session_id))?;
+        let test_config = local::test_detector::detect_test_command(&root);
+        Ok(Json(json!({
+            "detected": test_config.is_some(),
+            "language": test_config.as_ref().map(|c| format!("{:?}", c.language)),
+            "command": test_config.map(|c| c.command),
+        })))
+    })
+    .await
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
